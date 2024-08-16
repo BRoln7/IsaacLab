@@ -202,6 +202,7 @@ class Imu(SensorBase):
         # -- resolve the scales
         default_scale = self.acceleration_visualizer.cfg.markers["arrow"].scale
         arrow_scale = torch.tensor(default_scale, device=self.device).repeat(self._data.lin_acc_b.shape[0], 1)
+        arrow_scale[...,0] = arrow_scale[...,0]*(torch.linalg.norm(self._data.lin_acc_b)/10.0)
         # get up axis of current stage
         up_axis = stage_utils.get_stage_up_axis()
         # arrow-direction
