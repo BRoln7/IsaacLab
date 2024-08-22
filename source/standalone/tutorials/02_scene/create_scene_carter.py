@@ -4,7 +4,7 @@ from omni.isaac.lab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Tutorial on using the interactive scene interface.")
-parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to spawn.")
+parser.add_argument("--num_envs", type=int, default=4, help="Number of environments to spawn.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -22,18 +22,17 @@ from omni.isaac.lab.scene import InteractiveScene, InteractiveSceneCfg
 from omni.isaac.lab.sim import SimulationContext
 from omni.isaac.lab.utils import configclass
 
-from omni.isaac.lab_assets import CARTER_CFG, VELODYNE_VLP_16_RAYCASTER_CFG
+from omni.isaac.lab_assets import CARTER_CFG
 
-from omni.isaac.lab.sensors import CameraCfg, patterns, RayCasterCfg, RayCaster, RTXRayCasterCfg, RTXRayCaster
+from omni.isaac.lab.sensors import CameraCfg, RTXRayCasterCfg, RTXRayCaster
 
+import omni.isaac.core.utils.stage as stage_utils
+from omni.isaac.lab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+import numpy as np
 
 @configclass
 class CarterSceneCfg(InteractiveSceneCfg):
-    # ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
-    
-    # dome_light = AssetBaseCfg(
-    #     prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
-    # )
     environment = AssetBaseCfg(prim_path="/World/Warehouse", 
                                spawn=sim_utils.UsdFileCfg(
                                    usd_path=f"/home/social-navigation/USD-saver/full_warehouse.usd")
@@ -52,11 +51,55 @@ class CarterSceneCfg(InteractiveSceneCfg):
     )
 
     lidar = RTXRayCasterCfg(
-        prim_path="/World/envs/env_.*/Robot/nova_carter_sensors/chassis_link/lidar",
-        offset=RTXRayCasterCfg.OffsetCfg(),
-        spawn=sim_utils.LidarCfg(lidar_type=sim_utils.LidarCfg.LidarType.EXAMPLE_SOLID_STATE),
+        prim_path="/World/envs/env_.*/Robot/nova_carter_sensors/chassis_link/front_RPLidar/lidar",
+        offset=RTXRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=sim_utils.LidarCfg(lidar_type=sim_utils.LidarCfg.LidarType.VELODYNE_VLS128),
         debug_vis=True,
     )
+
+marker_cfg = VisualizationMarkersCfg(
+    prim_path="/World/Visuals/testMarkers",
+    markers={
+        "marker1": sim_utils.SphereCfg(
+            radius=0.04,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+        ),
+    }
+)
+lidar_marker = VisualizationMarkers(marker_cfg)
+
+def lidar_process(scene: InteractiveScene)->tuple[torch.Tensor, torch.Tensor]:
+    lidar = scene["lidar"]
+    print(type(lidar))
+    lidar_data = lidar.data[list(lidar.data.keys())[0]][0].data
+    lidar_ranges = lidar.data[list(lidar.data.keys())[0]][0].distance
+    z_min = -0.02
+    z_max = 0.02
+    z_data = lidar_data[:, 2]
+    mask = (z_data >= z_min) & (z_data <= z_max)
+    filtered_lidar_data = lidar_data[mask][0:950]
+    filtered_lidar_ranges = lidar_ranges[mask][0:950]
+    num_samples = 720
+    indices = torch.linspace(0, filtered_lidar_data.size(0) - 1, num_samples).long()
+    filtered_lidar_data = filtered_lidar_data[indices]
+    filtered_lidar_ranges = filtered_lidar_ranges[indices]    
+    print(filtered_lidar_data.shape)
+    return filtered_lidar_data, filtered_lidar_ranges
+
+def quat_to_rot_matrix(quat):
+    q = quat / torch.norm(quat)
+    w, x, y, z = q
+    rot_matrix = torch.tensor([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
+        [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
+        [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
+    ], device="cuda:0")
+    return rot_matrix
+
+def transform_to_robot(data, rot_matrix, translation):
+    data_rotated = torch.mm(data.to("cuda:0"), rot_matrix.to("cuda:0").t())
+    data_transformed = data_rotated + translation
+    return data_transformed
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["carter"]
@@ -89,15 +132,28 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         # Update buffers
         scene.update(sim_dt)
 
-        print("-------------------------------")
-        print(scene["camera"])
-        print("Received shape of rgb   image: ", scene["camera"].data.output["rgb"].shape)
-        print("Received shape of depth image: ", scene["camera"].data.output["distance_to_image_plane"].shape)
-        print("-------------------------------")
-        for key, value in scene["lidar"].data.items():
-            for lidar_data in value:
-                print(f"Data for {key}: {lidar_data.data}")
-                print(f"Distance for {key}: {lidar_data.distance}")
+        # print("-------------------------------")
+        # print(scene["camera"])
+        # print("Received shape of rgb   image: ", scene["camera"].data.output["rgb"].shape)
+        # print("Received shape of depth image: ", scene["camera"].data.output["distance_to_image_plane"].shape)
+        # print("-------------------------------")
+        filtered_lidar_data, filtered_lidar_ranges = lidar_process(scene)
+        """
+        for visualize with markers
+        """
+        if filtered_lidar_data.size(0) >= 300:
+            lidar_to_robot_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda:0")
+            lidar_to_robot_pos = torch.tensor([0.026, 0.0, 0.418], device="cuda:0")
+            rot_matrix = quat_to_rot_matrix(lidar_to_robot_quat)
+            robot_data = transform_to_robot(filtered_lidar_data, rot_matrix, lidar_to_robot_pos)
+
+            robot_to_world_quat = robot.data.root_quat_w[0]
+            robot_to_world_pos = robot.data.root_pos_w[0]
+            robot_rot_matrix = quat_to_rot_matrix(robot_to_world_quat)
+            lidar_data_world = transform_to_robot(robot_data, robot_rot_matrix, robot_to_world_pos)
+
+            lidar_marker.visualize(translations=lidar_data_world)
+
 
 def main():
     """Main function."""
