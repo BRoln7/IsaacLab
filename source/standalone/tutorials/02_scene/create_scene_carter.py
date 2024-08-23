@@ -70,7 +70,7 @@ lidar_marker = VisualizationMarkers(marker_cfg)
 
 def lidar_process(scene: InteractiveScene)->tuple[torch.Tensor, torch.Tensor]:
     lidar = scene["lidar"]
-    print(type(lidar))
+    print(lidar.data)
     lidar_data = lidar.data[list(lidar.data.keys())[0]][0].data
     lidar_ranges = lidar.data[list(lidar.data.keys())[0]][0].distance
     z_min = -0.02

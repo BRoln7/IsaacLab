@@ -27,16 +27,32 @@ device = "cuda:0"
 motor_scale = 50
 
 # visualize
+# lidar marker
 marker_cfg = VisualizationMarkersCfg(
     prim_path="/World/Visuals/LidarMarkers",
     markers={
-        "marker1": sim_utils.SphereCfg(
+        "marker": sim_utils.SphereCfg(
             radius=0.04,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
         ),
     }
 )
 lidar_marker = VisualizationMarkers(marker_cfg)
+# goal marker
+goal_cfg = VisualizationMarkersCfg(
+    prim_path="/World/Visuals/GoalMarkers",
+    markers={
+        "marker": sim_utils.ConeCfg(
+            radius=0.6,
+            height=0.8,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.5, 0.5)),
+        ),
+    }
+)
+goal_marker = VisualizationMarkers(goal_cfg)
+
+goal = torch.Tensor([[0.0, 0.0, 0.0],
+                     [-5.0, 0.0, 0.0]]).to(device)
 
 @configclass
 class CarterEnvCfg(DirectRLEnvCfg):
@@ -76,10 +92,10 @@ class CarterEnvCfg(DirectRLEnvCfg):
     )
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8, env_spacing=5.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=5.0, replicate_physics=True)
 
     # reset
-    max_cart_pos = 5.0  # the carter is reset if it exceeds that position [m]
+    max_cart_pos = 8.0  # the carter is reset if it exceeds that position [m]
     initial_pole_angle_range = [-0.25, 0.25]  # the range in which the pole angle is sampled from on reset [rad]
 
     # reward scales
@@ -89,20 +105,36 @@ class CarterEnvCfg(DirectRLEnvCfg):
     rew_scale_cart_vel = -0.01
     rew_scale_pole_vel = -0.005
 
-
+"""
+for visualize
+"""
 def quat_to_rot_matrix(quat):
-    q = quat / torch.norm(quat)
-    w, x, y, z = q
-    rot_matrix = torch.tensor([
-        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
-        [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-        [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
-    ], device=device)
+    rot_matrix = []
+    for i in range(quat.size(0)):
+        quat_tmp = quat[i]
+        q = quat_tmp / torch.norm(quat_tmp)
+        w, x, y, z = q
+        rot_matrix_tmp = torch.tensor([
+            [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
+            [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
+            [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
+        ], device=device)
+        rot_matrix.append(rot_matrix_tmp)
+    rot_matrix = torch.stack(rot_matrix)
     return rot_matrix
 
 def transform_to_robot(data, rot_matrix, translation):
-    data_rotated = torch.mm(data.to(device), rot_matrix.to(device).t())
-    data_transformed = data_rotated + translation
+    # print("data shape:", data.shape, rot_matrix.shape)
+    data_transformed = []
+    for i in range(data.size(0)):
+        data_tmp = data[i]
+        rot_matrix_tmp = rot_matrix[i]
+        translation_tmp = translation[i]
+        data_rotated = torch.mm(data_tmp.to(device), rot_matrix_tmp.to(device).t())
+        data_transformed_tmp = data_rotated + translation_tmp
+        data_transformed.append(data_transformed_tmp)
+    data_transformed = torch.stack(data_transformed)
+    # print("data_transformed shape:", data_transformed.shape)
     return data_transformed
 
 class CarterEnv(DirectRLEnv):
@@ -118,17 +150,18 @@ class CarterEnv(DirectRLEnv):
         self.joint_pos = self.carter.data.joint_pos
         self.joint_vel = self.carter.data.joint_vel
 
-        self.lidar_history_data = torch.Tensor([]).to(device)
+        self.lidar_history_data = torch.Tensor([[]]).to(device)
         self.pooling_tns = 0
+
 
     def _setup_scene(self):
         env_cfg = sim_utils.UsdFileCfg(usd_path=f"/home/social-navigation/USD-saver/full_warehouse.usd")
         env_cfg.func("/World/full_warehouse", env_cfg)  
-        self.carter = Articulation(self.cfg.robot_cfg)
         # clone, filter, and replicate
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=[])
         # add articultion to scene
+        self.carter = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["carter"] = self.carter
         self.lidar = RTXRayCaster(self.cfg.lidar)
         self.scene.sensors["lidar"] = self.lidar
@@ -139,7 +172,7 @@ class CarterEnv(DirectRLEnv):
         print("self.actions", self.actions)
 
     def _apply_action(self) -> None:
-        controller = torch.zeros(2, 7).to(device)
+        controller = torch.zeros(self.num_envs, 7).to(device)
         # self.carter.set_joint_effort_target(target=self.actions)
         self.carter.set_joint_effort_target(target=controller)
 
@@ -149,30 +182,37 @@ class CarterEnv(DirectRLEnv):
         lidar_ranges = torch.Tensor([]).to(device)
         lidar_data, lidar_ranges = raw_lidar_process(self.lidar)
         lidar_data_final, pooling_flag, self.lidar_history_data, self.pooling_tns =\
-              _lidar_Pooling(self.lidar_history_data, lidar_ranges, self.pooling_tns)
-        # visulize lidar
-        if lidar_ranges.size(0) >= 300:
-            lidar_to_robot_quat = torch.tensor([1.0, 0.0, 0.0, 0.0]).to(device)
-            lidar_to_robot_pos = torch.tensor([0.026, 0.0, 0.418]).to(device)
+              lidar_pooling(self.lidar_history_data, lidar_ranges, self.pooling_tns)
+        
+        # visulize lidar data
+        if lidar_data.dim() > 1 and lidar_data.size(1) >= 300:
+            lidar_to_robot_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0],
+                                                [1.0, 0.0, 0.0, 0.0]]).to(device)
+            lidar_to_robot_pos = torch.tensor([[0.026, 0.0, 0.418],
+                                               [0.026, 0.0, 0.418]]).to(device)
             rot_matrix = quat_to_rot_matrix(lidar_to_robot_quat)
-            lidar_robot_data = transform_to_robot(lidar_ranges, rot_matrix, lidar_to_robot_pos)
+            lidar_robot_data = transform_to_robot(lidar_data, rot_matrix, lidar_to_robot_pos)
 
-            robot_to_world_quat = self.carter.data.root_quat_w[0]
-            robot_to_world_pos = self.carter.data.root_pos_w[0]
+            robot_to_world_quat = self.carter.data.root_quat_w
+            robot_to_world_pos = self.carter.data.root_pos_w
             robot_rot_matrix = quat_to_rot_matrix(robot_to_world_quat)
             lidar_data_world = transform_to_robot(lidar_robot_data, robot_rot_matrix, robot_to_world_pos)
 
+            lidar_data_world = lidar_data_world.reshape(-1, 3)
             lidar_marker.visualize(translations=lidar_data_world)
 
         # process peds data 
+    
 
         # process subgoal data
-
+        lookahead = torch.Tensor([2.0]).to(device)
+        subgoal = subgoal_get( goal, self.carter.data.root_pos_w, lookahead)
+        goal_marker.visualize(translations=goal)
 
         # concat observation
         # if pooling_flag:
         #     obs = torch.cat((self.ped_pos, lidar_data_final, self.goal), axis=None)
-        obs = torch.zeros(19202).to(device) / 50
+        obs = torch.zeros(19202).to(device)
 
         observations = {"policy": obs}
         return observations
@@ -255,28 +295,36 @@ def raw_lidar_process(_lidar:RTXRayCaster) -> tuple[torch.Tensor, torch.Tensor]:
     load raw lidar data and extract the 720 points needed
     """
     lidar = _lidar
-    # print("lidar:"type(lidar))
     lidar_data = lidar.data[list(lidar.data.keys())[0]][0].data
-    lidar_ranges = lidar.data[list(lidar.data.keys())[0]][0].distance
-    print("lidar_data size:",lidar_data.shape)
+    # print("lidar_data size:",lidar_data.shape)
     if lidar_data.size(0) != 0:
-        print("lidar_data size:", lidar_data)
-        z_min = -0.02
-        z_max = 0.02
-        z_data = lidar_data[:, 2]
-        mask = (z_data >= z_min) & (z_data <= z_max)
-        filtered_lidar_data = lidar_data[mask][0:950]
-        filtered_lidar_ranges = lidar_ranges[mask][0:950]
-        num_samples = 720
-        indices = torch.linspace(0, filtered_lidar_data.size(0) - 1, num_samples).long()
-        filtered_lidar_data = filtered_lidar_data[indices]
-        filtered_lidar_ranges = filtered_lidar_ranges[indices]    
-        print(filtered_lidar_data.shape)
-        return filtered_lidar_data, filtered_lidar_ranges
+        lidar_data_list = []
+        lidar_ranges_list = []
+        for key in lidar.data:
+            lidar_data = lidar.data[key][0].data
+            lidar_ranges = lidar.data[key][0].distance
+            z_min = -0.02
+            z_max = 0.02
+            z_data = lidar_data[:, 2]
+            mask = (z_data >= z_min) & (z_data <= z_max)
+            filtered_lidar_data = lidar_data[mask][0:970]
+            filtered_lidar_ranges = lidar_ranges[mask][0:970]
+            num_samples = 720
+            indices = torch.linspace(0, filtered_lidar_data.size(0) - 1, num_samples).long()
+            filtered_lidar_data = filtered_lidar_data[indices]
+            filtered_lidar_ranges = filtered_lidar_ranges[indices]    
+            # print("filtered lidar_data size:", filtered_lidar_data.shape)
+            lidar_data_list.append(filtered_lidar_data)
+            lidar_ranges_list.append(filtered_lidar_ranges)
+        final_lidar_data = torch.stack(lidar_data_list)
+        final_lidar_ranges = torch.stack(lidar_ranges_list)
+        # print("final_lidar_data shape:", final_lidar_data.shape, 
+        #       "final_lidar_range shape", final_lidar_ranges.shape)
+        return final_lidar_data.to(device), final_lidar_ranges.to(device)
     else: 
         return torch.Tensor([]).to(device), torch.Tensor([]).to(device)
 
-def _lidar_Pooling(_lidar_history_data:torch.Tensor, 
+def lidar_pooling(_lidar_history_data:torch.Tensor, 
                    _scan_tmp:torch.Tensor, 
                    _pooling_tns)->tuple[torch.Tensor, bool, torch.Tensor, int]:
     """
@@ -286,33 +334,119 @@ def _lidar_Pooling(_lidar_history_data:torch.Tensor,
     _pooling_tns: times poolinged
     cnn_lidar: full data to be processed
     """
-    cnn_lidar_tmp = torch.cat((_lidar_history_data, _scan_tmp), dim=0)
+    if _scan_tmp.dim() <= 1:
+        return torch.Tensor([]).to(device), False, torch.Tensor([]).to(device), 0
+
+    # print("_lidar_history_data.shape:", _lidar_history_data.shape)
+    # print("_scan_tmp.shape:", _scan_tmp.shape)
+    
+    # stack current frame scan 
+    cnn_lidar_tmp = []
+    for i in range(_scan_tmp.size(0)):
+        if _lidar_history_data.size(0) == 0:
+            cnn_lidar_tmp.append(_scan_tmp[i].reshape(1, 720))
+        else:
+            cnn_lidar_tmp.append(torch.cat((_lidar_history_data[i], 
+                                            _scan_tmp[i].reshape(1, 720)), dim=0))
     _pooling_tns += 1
+    cnn_lidar_tmp = torch.stack(cnn_lidar_tmp)
+    # print("cnn_lidar_tmp shape:", cnn_lidar_tmp.shape)
     
     if _pooling_tns == NUM_TP:
-        cnn_lidar = cnn_lidar_tmp.flatten()
+        cnn_lidar = cnn_lidar_tmp.reshape(_scan_tmp.size(0), -1)
+        # print("cnn_lidar shape:", cnn_lidar.shape)
         # Kick out frame 0 lidar data
         _pooling_tns = NUM_TP - 1
-        _lidar_history_data = cnn_lidar_tmp[1:NUM_TP]
+        _lidar_history_data = cnn_lidar_tmp[:, 1:NUM_TP]
+        # print("lidar_history_data shape:", _lidar_history_data.shape)
+        
         # MaxAbsScaler:
-        lidar_avg = torch.zeros((20,80)).to(device)
-        for n in range(NUM_TP):
-            lidar_tmp = cnn_lidar[n*720:(n+1)*720]
-            for i in range(80):
-                lidar_avg[2*n, i] = torch.min(lidar_tmp[i*9:(i+1)*9])
-                lidar_avg[2*n+1, i] = torch.mean(lidar_tmp[i*9:(i+1)*9])
+        lidar_avg_all = []
+        for j in range(_scan_tmp.size(0)):
+            lidar_avg = torch.zeros((20, 80)).to(device)
+            for n in range(NUM_TP):
+                lidar_tmp = cnn_lidar[j, n*720:(n+1)*720]
+                # if n == 9:
+                #     print("lidar tmp:",lidar_tmp)
+                for i in range(80):
+                    lidar_avg[2*n, i] = torch.min(lidar_tmp[i*9:(i+1)*9])
+                    lidar_avg[2*n+1, i] = torch.mean(lidar_tmp[i*9:(i+1)*9])
+            lidar_avg_all.append(lidar_avg)
+        lidar_avg_all = torch.stack(lidar_avg_all)
+        # print("lidar_avg_all shape:", lidar_avg_all.shape)
+        
         # stack 4 times
-        lidar_avg = lidar_avg.reshape(1600)
-        lidar_avg_map = lidar_avg.repeat(1, 4)
-        lidar_data_final = lidar_avg_map.reshape(6400)
-        s_min = 0
-        s_max = 30
-        lidar_data_final = 2 * (lidar_data_final - s_min) / (s_max - s_min) + (-1)
-
+        lidar_data_final = []
+        for lidar_avg in lidar_avg_all:
+            lidar_avg = lidar_avg.reshape(1600)
+            lidar_avg_map = lidar_avg.repeat(1, 4)
+            lidar_avg_map = lidar_avg_map.reshape(6400)
+            s_min = 0
+            s_max = 30
+            lidar_avg_map = 2 * (lidar_avg_map - s_min) / (s_max - s_min) + (-1)
+            lidar_data_final.append(lidar_avg_map)
+        lidar_data_final = torch.stack(lidar_data_final)
+        # print("lidar_data_final shape:",lidar_data_final.shape)
         return lidar_data_final, True, _lidar_history_data, _pooling_tns
 
     else:
         return cnn_lidar_tmp, False, cnn_lidar_tmp, _pooling_tns
+
+def ped_encoder():
+    """
+    encode peds' poses and positions into grid maps in world-frame
+    """
+    # # get the pedstrain's position:
+    # self.ped_pos_map_tmp = np.zeros((2,80,80))  # cartesian velocity map
+    # if(len(trackPed_msg.tracks) != 0):  # tracker results
+    #     for ped in trackPed_msg.tracks:
+    #         #ped_id = ped.track_id 
+    #         # create pedestrian's postion costmap: 10*10 m
+    #         x = ped.pose.pose.position.x
+    #         y = ped.pose.pose.position.y
+    #         vx = ped.twist.twist.linear.x
+    #         vy = ped.twist.twist.linear.y
+    #         # 20m * 20m occupancy map:
+    #         if(x >= 0 and x <= 20 and np.abs(y) <= 10):
+    #             # bin size: 0.25 m
+    #             c = int(np.floor(-(y-10)/0.25))
+    #             r = int(np.floor(x/0.25))
+
+    #             if(r == 80):
+    #                 r = r - 1
+    #             if(c == 80):
+    #                 c = c - 1
+    #             # cartesian velocity map
+    #             self.ped_pos_map_tmp[0,r,c] = vx
+    #             self.ped_pos_map_tmp[1,r,c] = vy
+
+def ped_transformer():
+    """
+    transform the peds' grid maps from world frame into robot frame
+    """
+
+def subgoal_get(_goal:torch.Tensor, _robot_position:torch.Tensor, _lookahead:torch.Tensor)->torch.Tensor:
+    subgoal_in_robot = []
+    g_min = -2
+    g_max = 2
+    for i in range(_goal.size(0)):
+        goal_in_robot_tmp = torch.Tensor([_goal[i, 0]-_robot_position[i, 0],
+                                          _goal[i, 1]-_robot_position[i, 1],
+                                          _goal[i, 2]-_robot_position[i, 2]]).to(device)
+        if torch.sqrt(goal_in_robot_tmp[0] * goal_in_robot_tmp[0]+
+                      goal_in_robot_tmp[1] * goal_in_robot_tmp[1]) > _lookahead:
+            scale_factor = _lookahead / torch.sqrt(goal_in_robot_tmp[0] * goal_in_robot_tmp[0]+
+                                                   goal_in_robot_tmp[1] * goal_in_robot_tmp[1])
+            subgoal_in_robot_tmp = torch.Tensor([goal_in_robot_tmp[0]*scale_factor,
+                                                 goal_in_robot_tmp[1]*scale_factor, 0.0]).to(device)
+        else:
+            subgoal_in_robot_tmp = goal_in_robot_tmp
+        subgoal_in_robot_tmp = 2 * (subgoal_in_robot_tmp - g_min) / (g_max - g_min) + (-1)
+        subgoal_in_robot.append(subgoal_in_robot_tmp)
+    subgoal_in_robot = torch.stack(subgoal_in_robot)
+    print("subgoal:", subgoal_in_robot)
+    return subgoal_in_robot
+
 
 def Different_Controller() -> tuple[torch.Tensor]:
     Controller = torch.zeros()
