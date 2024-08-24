@@ -116,7 +116,7 @@ def main():
         net_arch=dict(pi=[256], vf=[128])
     )
     agent = PPO.load(checkpoint_path, env, print_system_info=True, policy_kwargs=policy_kwargs)
-
+    # agent.save("source/examples/sn-isaac/model/drl_vo_new.zip")
     # reset environment
     obs = env.reset()
     timestep = 0

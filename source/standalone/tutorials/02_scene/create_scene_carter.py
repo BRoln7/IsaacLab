@@ -31,6 +31,11 @@ from omni.isaac.lab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 import numpy as np
 
+motor_scale = 0.5   # corresponding to joint 42 power
+joint_base = 42
+base_width = 0.4132
+system_gain = 1.25
+
 @configclass
 class CarterSceneCfg(InteractiveSceneCfg):
     environment = AssetBaseCfg(prim_path="/World/Warehouse", 
@@ -70,7 +75,7 @@ lidar_marker = VisualizationMarkers(marker_cfg)
 
 def lidar_process(scene: InteractiveScene)->tuple[torch.Tensor, torch.Tensor]:
     lidar = scene["lidar"]
-    print(lidar.data)
+    # print(lidar.data)
     lidar_data = lidar.data[list(lidar.data.keys())[0]][0].data
     lidar_ranges = lidar.data[list(lidar.data.keys())[0]][0].distance
     z_min = -0.02
@@ -83,7 +88,7 @@ def lidar_process(scene: InteractiveScene)->tuple[torch.Tensor, torch.Tensor]:
     indices = torch.linspace(0, filtered_lidar_data.size(0) - 1, num_samples).long()
     filtered_lidar_data = filtered_lidar_data[indices]
     filtered_lidar_ranges = filtered_lidar_ranges[indices]    
-    print(filtered_lidar_data.shape)
+    # print(filtered_lidar_data.shape)
     return filtered_lidar_data, filtered_lidar_ranges
 
 def quat_to_rot_matrix(quat):
@@ -100,6 +105,19 @@ def transform_to_robot(data, rot_matrix, translation):
     data_rotated = torch.mm(data.to("cuda:0"), rot_matrix.to("cuda:0").t())
     data_transformed = data_rotated + translation
     return data_transformed
+
+def differential_drive_solver(vx, wf):
+    vx_base = motor_scale
+    pl_pr_base = joint_base
+    gain = system_gain # Adjust gain based on the system's response
+
+    v_left = vx - (wf * base_width / 2.0)
+    v_right = vx + (wf * base_width / 2.0)
+
+    pl = gain * (v_left / vx_base) * pl_pr_base
+    pr = gain * (v_right / vx_base) * pl_pr_base
+
+    return pl, pr
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["carter"]
@@ -120,7 +138,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             scene.reset()
             print("[INFO]: Resetting robot state...")
         # Apply action
-        efforts = torch.tensor([[0, 60, 60, 0, 0, 0, 0]])
+
+        vx = 0.5
+        wf = -0.5
+        pl,pr = differential_drive_solver(vx, wf)
+        efforts = torch.tensor([[0, pl, pr, 0, 0, 0, 0]])
+        print("efforts:", efforts)
         # -- apply action to the robot
         robot.set_joint_effort_target(efforts)
         # -- write data to sim
@@ -138,6 +161,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         # print("Received shape of depth image: ", scene["camera"].data.output["distance_to_image_plane"].shape)
         # print("-------------------------------")
         filtered_lidar_data, filtered_lidar_ranges = lidar_process(scene)
+        
+        print("robot velocity:", robot.data.root_lin_vel_w, robot.data.root_ang_vel_w)
         """
         for visualize with markers
         """

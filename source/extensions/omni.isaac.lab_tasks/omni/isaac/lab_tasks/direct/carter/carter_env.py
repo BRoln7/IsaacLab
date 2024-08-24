@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import torch
+import torch.nn.functional as F
 from collections.abc import Sequence
 
 from omni.isaac.lab_assets.carter import CARTER_CFG
@@ -24,7 +25,10 @@ from omni.isaac.lab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 NUM_TP = 10
 device = "cuda:0"
-motor_scale = 50
+motor_scale = 0.5   # corresponding to joint 42 power
+joint_base = 42
+base_width = 0.4132
+system_gain = 1.25
 
 # visualize
 # lidar marker
@@ -51,14 +55,14 @@ goal_cfg = VisualizationMarkersCfg(
 )
 goal_marker = VisualizationMarkers(goal_cfg)
 
-goal = torch.Tensor([[0.0, 0.0, 0.0],
-                     [-5.0, 0.0, 0.0]]).to(device)
+goal = torch.Tensor([[-5.0, -2.0],
+                     [-10.0, -2.0]]).to(device)
 
 @configclass
 class CarterEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 10.0
+    episode_length_s = 512.0
     action_scale = motor_scale  # [N]
     num_actions = 2
     num_observations = 19202 
@@ -95,7 +99,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=5.0, replicate_physics=True)
 
     # reset
-    max_cart_pos = 8.0  # the carter is reset if it exceeds that position [m]
+    max_cart_pos = 40.0  # the carter is reset if it exceeds that position [m]
     initial_pole_angle_range = [-0.25, 0.25]  # the range in which the pole angle is sampled from on reset [rad]
 
     # reward scales
@@ -137,6 +141,21 @@ def transform_to_robot(data, rot_matrix, translation):
     # print("data_transformed shape:", data_transformed.shape)
     return data_transformed
 
+def quaternion_to_angle(quat):
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    r11 = 1 - 2 * (y**2 + z**2)
+    r21 = 2 * (x * y - w * z)
+    angles = torch.atan2(r21, r11)
+    angles = (angles + math.pi) % (2 * math.pi) - math.pi
+    return angles
+
+def goal_rotate(angle, relative_goal):
+    x_new = relative_goal[0] * torch.cos(angle) - relative_goal[1] * torch.sin(angle)
+    y_new = relative_goal[0] * torch.sin(angle) + relative_goal[1] * torch.cos(angle)
+    relative_goal[0] = x_new
+    relative_goal[1] = y_new
+    return relative_goal
+
 class CarterEnv(DirectRLEnv):
     cfg: CarterEnvCfg
 
@@ -168,12 +187,12 @@ class CarterEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = self.action_scale * actions.clone()
-        print("self.action_scale:", self.action_scale)
+        # print("self.action_scale:", self.action_scale)
         print("self.actions", self.actions)
 
     def _apply_action(self) -> None:
-        controller = torch.zeros(self.num_envs, 7).to(device)
-        # self.carter.set_joint_effort_target(target=self.actions)
+        controller = differential_drive_solver(self.actions)
+        # controller = torch.zeros(self.num_envs, 7).to(device)
         self.carter.set_joint_effort_target(target=controller)
 
     def _get_observations(self) -> dict:
@@ -202,22 +221,34 @@ class CarterEnv(DirectRLEnv):
             lidar_marker.visualize(translations=lidar_data_world)
 
         # process peds data 
-    
+        ped_pos = torch.zeros(self.num_envs, 12800).to(device)    
 
         # process subgoal data
+        robot_to_world_quat = self.carter.data.root_quat_w
+        robot_to_world_pos = self.carter.data.root_pos_w[:, :2]
+        relative_goal = goal - robot_to_world_pos
+        angle_x_axis = quaternion_to_angle(robot_to_world_quat)
+        print("angle_x_axis:", angle_x_axis)
+        for i in range(relative_goal.size(0)):
+            relative_goal[i] = goal_rotate(angle_x_axis[i], relative_goal[i])
+        print("goal_in_robot:", relative_goal)
         lookahead = torch.Tensor([2.0]).to(device)
-        subgoal = subgoal_get( goal, self.carter.data.root_pos_w, lookahead)
-        goal_marker.visualize(translations=goal)
+        subgoal = subgoal_get(relative_goal, lookahead)
+
+        z_zeros = torch.zeros(goal.shape[0], 1).to(device)
+        goal_with_z = torch.cat((goal, z_zeros), dim=-1)  # Concatenate along the last dimension to add the z-axis
+        goal_marker.visualize(translations=goal_with_z.reshape(self.num_envs, 3))
+
 
         # concat observation
-        # if pooling_flag:
-        #     obs = torch.cat((self.ped_pos, lidar_data_final, self.goal), axis=None)
-        obs = torch.zeros(19202).to(device)
+        if pooling_flag:
+            # print("peds, lidar and subgoal shape:",ped_pos.shape, lidar_data_final.shape, subgoal.shape)
+            obs = torch.cat((ped_pos, lidar_data_final, subgoal), dim=1)
+        else:
+            obs = torch.zeros(self.num_envs, 19202).to(device)
 
         observations = {"policy": obs}
         return observations
-
-        
 
     def _get_rewards(self) -> torch.Tensor:
         total_reward = compute_rewards(
@@ -239,8 +270,12 @@ class CarterEnv(DirectRLEnv):
         self.joint_vel = self.carter.data.joint_vel
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if torch.any(time_out):
+            print("TIME OUT!!", time_out)
         out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._left_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._right_dof_idx]) > math.pi / 2, dim=1)
+        if torch.any(out_of_bounds):
+            print("OUT OF BOUND:", out_of_bounds)    
+        # print(out_of_bounds)    
         return out_of_bounds, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -425,28 +460,49 @@ def ped_transformer():
     transform the peds' grid maps from world frame into robot frame
     """
 
-def subgoal_get(_goal:torch.Tensor, _robot_position:torch.Tensor, _lookahead:torch.Tensor)->torch.Tensor:
+def subgoal_get(_goal:torch.Tensor, _lookahead:torch.Tensor)->torch.Tensor:
     subgoal_in_robot = []
     g_min = -2
     g_max = 2
     for i in range(_goal.size(0)):
-        goal_in_robot_tmp = torch.Tensor([_goal[i, 0]-_robot_position[i, 0],
-                                          _goal[i, 1]-_robot_position[i, 1],
-                                          _goal[i, 2]-_robot_position[i, 2]]).to(device)
+        goal_in_robot_tmp = torch.Tensor([_goal[i, 0], _goal[i, 1]]).to(device)
         if torch.sqrt(goal_in_robot_tmp[0] * goal_in_robot_tmp[0]+
                       goal_in_robot_tmp[1] * goal_in_robot_tmp[1]) > _lookahead:
             scale_factor = _lookahead / torch.sqrt(goal_in_robot_tmp[0] * goal_in_robot_tmp[0]+
                                                    goal_in_robot_tmp[1] * goal_in_robot_tmp[1])
             subgoal_in_robot_tmp = torch.Tensor([goal_in_robot_tmp[0]*scale_factor,
-                                                 goal_in_robot_tmp[1]*scale_factor, 0.0]).to(device)
+                                                 goal_in_robot_tmp[1]*scale_factor]).to(device)
         else:
             subgoal_in_robot_tmp = goal_in_robot_tmp
+        # print("subgoal_in_robot:", subgoal_in_robot_tmp)
         subgoal_in_robot_tmp = 2 * (subgoal_in_robot_tmp - g_min) / (g_max - g_min) + (-1)
         subgoal_in_robot.append(subgoal_in_robot_tmp)
     subgoal_in_robot = torch.stack(subgoal_in_robot)
-    print("subgoal:", subgoal_in_robot)
+
     return subgoal_in_robot
 
 
-def Different_Controller() -> tuple[torch.Tensor]:
-    Controller = torch.zeros()
+def differential_drive_solver(actions:torch.Tensor)->torch.Tensor:
+    action_list = []
+    for i in range(actions.size(0)):
+        vx = actions[i, 0]
+        wf = actions[i, 1]
+        action = torch.zeros(7).to(device)
+
+        vx_base = motor_scale 
+        pl_pr_base = joint_base  
+        gain = system_gain  # Adjust gain based on the system's response
+
+        v_left = vx - (wf * base_width / 2.0)
+        v_right = vx + (wf * base_width / 2.0)
+
+        pl = gain * (v_left / vx_base) * pl_pr_base
+        pr = gain * (v_right / vx_base) * pl_pr_base
+
+        action[1] = pl
+        action[2] = pr
+
+        action_list.append(action)
+    action_list = torch.stack(action_list)
+    # print("action:", action_list)
+    return action_list
